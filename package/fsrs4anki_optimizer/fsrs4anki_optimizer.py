@@ -37,7 +37,7 @@ class FSRS(nn.Module):
     def stability_after_failure(self, state: Tensor, new_d: Tensor, r: Tensor) -> Tensor:
         new_s = self.w[9] * torch.pow(new_d, self.w[10]) * torch.pow(
             state[:,0], self.w[11]) * torch.exp((1 - r) * self.w[12])
-        return new_s
+        return new_s.clamp(max=state[:,0])
 
     def step(self, X: Tensor, state: Tensor) -> Tensor:
         '''
@@ -108,7 +108,7 @@ def lineToTensor(line: str) -> Tensor:
 
 class RevlogDataset(Dataset):
     def __init__(self, dataframe: pd.DataFrame):
-        if len(dataframe) == 0:
+        if dataframe.empty:
             raise ValueError('Training data is inadequate.')
         padded = pad_sequence(dataframe['tensor'].to_list(), batch_first=True, padding_value=0)
         self.x_train = padded.int()
@@ -130,10 +130,13 @@ class RevlogSampler(Sampler[List[int]]):
         indices = np.argsort(lengths)
         full_batches, remainder = divmod(indices.size, self.batch_size)
         if full_batches > 0:
-            self.batch_indices = np.split(indices[:-remainder], full_batches)
+            if remainder == 0:
+                self.batch_indices = np.split(indices, full_batches)
+            else:
+                self.batch_indices = np.split(indices[:-remainder], full_batches)
         else:
             self.batch_indices = []
-        if remainder:
+        if remainder > 0:
             self.batch_indices.append(indices[-remainder:])
         self.batch_nums = len(self.batch_indices)
         # seed = int(torch.empty((), dtype=torch.int64).random_().item())
@@ -142,7 +145,7 @@ class RevlogSampler(Sampler[List[int]]):
         self.generator.manual_seed(seed)
 
     def __iter__(self):
-        yield from [self.batch_indices[idx] for idx in torch.randperm(self.batch_nums, generator=self.generator).tolist()]
+        yield from (self.batch_indices[idx] for idx in torch.randperm(self.batch_nums, generator=self.generator).tolist())
 
     def __len__(self):
         return len(self.data_source)
@@ -192,7 +195,7 @@ class Trainer:
         self.test_data_loader = DataLoader(self.test_set, batch_sampler=sampler, collate_fn=collate_fn)
         print("dataset built")
 
-    def train(self):
+    def train(self, verbose: bool=True):
         # pretrain
         best_loss = np.inf
         weighted_loss, w = self.eval()
@@ -218,7 +221,7 @@ class Trainer:
 
         pbar.close()
         for name, param in self.model.named_parameters():
-            print(f"{name}: {list(map(lambda x: round(float(x), 4),param))}")
+            tqdm.write(f"{name}: {list(map(lambda x: round(float(x), 4),param))}")
 
         epoch_len = len(self.next_train_data_loader)
         pbar = tqdm(desc="train", colour="red", total=epoch_len*self.n_epoch)
@@ -246,7 +249,7 @@ class Trainer:
                 self.model.apply(self.clipper)
                 pbar.update(real_batch_size)
 
-                if (k * self.batch_nums + i + 1) % print_len == 0:
+                if verbose and (k * self.batch_nums + i + 1) % print_len == 0:
                     tqdm.write(f"iteration: {k * epoch_len + (i + 1) * self.batch_size}")
                     for name, param in self.model.named_parameters():
                         tqdm.write(f"{name}: {list(map(lambda x: round(float(x), 4),param))}")
@@ -309,9 +312,10 @@ class Collection:
 
     def batch_predict(self, dataset):
         fast_dataset = RevlogDataset(dataset)
-        outputs, _ = self.model(fast_dataset.x_train.transpose(0, 1))
-        stabilities, difficulties = outputs[fast_dataset.seq_len-1, torch.arange(len(fast_dataset))].transpose(0, 1)
-        return stabilities.tolist(), difficulties.tolist()
+        with torch.no_grad():
+            outputs, _ = self.model(fast_dataset.x_train.transpose(0, 1))
+            stabilities, difficulties = outputs[fast_dataset.seq_len-1, torch.arange(len(fast_dataset))].transpose(0, 1)
+            return stabilities.tolist(), difficulties.tolist()
 
 """Used to store all the results from FSRS related functions"""
 class Optimizer:
@@ -326,7 +330,7 @@ class Optimizer:
             zip_ref.extractall('./')
             print("Deck file extracted successfully!")
 
-    def create_time_series(self, timezone: str, revlog_start_date: str, next_day_starts_at: int):
+    def create_time_series(self, timezone: str, revlog_start_date: str, next_day_starts_at: int, filter_out_suspended_cards: bool = False):
         """Step 2"""
         if os.path.isfile("collection.anki21b"):
             os.remove("collection.anki21b")
@@ -339,27 +343,49 @@ class Optimizer:
         else:
             raise Exception("Collection not exist!")
         cur = con.cursor()
-        res = cur.execute("SELECT * FROM revlog")
+        res = cur.execute(f"""
+        SELECT *
+        FROM revlog
+        WHERE cid IN (
+            SELECT id
+            FROM cards
+            {"WHERE queue != -1" if filter_out_suspended_cards else ""}
+        )
+        """
+        )
         revlog = res.fetchall()
         if len(revlog) == 0:
             raise Exception("No review log found!")
         df = pd.DataFrame(revlog)
         df.columns = ['id', 'cid', 'usn', 'r', 'ivl', 'last_lvl', 'factor', 'time', 'type']
         df = df[(df['cid'] <= time.time() * 1000) &
-                (df['id'] <= time.time() * 1000) &
-                (df['r'] > 0)].copy()
+                (df['id'] <= time.time() * 1000)].copy()
+        
+        df_set_due_date = df[(df['type'] == 4) & (df['ivl'] > 0)]
+        df.drop(df_set_due_date.index, inplace=True)
+
         df['create_date'] = pd.to_datetime(df['cid'] // 1000, unit='s')
         df['create_date'] = df['create_date'].dt.tz_localize('UTC').dt.tz_convert(timezone)
         df['review_date'] = pd.to_datetime(df['id'] // 1000, unit='s')
         df['review_date'] = df['review_date'].dt.tz_localize('UTC').dt.tz_convert(timezone)
         df.drop(df[df['review_date'].dt.year < 2006].index, inplace=True)
         df.sort_values(by=['cid', 'id'], inplace=True, ignore_index=True)
+
+        df['is_learn_start'] = (df['type'] == 0) & (df['type'].shift() != 0)
+        df['sequence_group'] = df['is_learn_start'].cumsum()
+        last_learn_start = df[df['is_learn_start']].groupby('cid')['sequence_group'].last()
+        df['last_learn_start'] = df['cid'].map(last_learn_start).fillna(0).astype(int)
+        df['mask'] = df['last_learn_start'] <= df['sequence_group']
+        df = df[df['mask'] == True].copy()
+        df.drop(columns=['is_learn_start', 'sequence_group', 'last_learn_start', 'mask'], inplace=True)
+        df = df[(df['type'] != 4)].copy()
+
         self.type_sequence = np.array(df['type'])
         self.time_sequence = np.array(df['time'])
         df.to_csv("revlog.csv", index=False)
         print("revlog.csv saved.")
 
-        df = df[df['type'] != 3].copy()
+        df = df[(df['type'] != 3) | (df['factor'] != 0)].copy()
         df['real_days'] = df['review_date'] - timedelta(hours=int(next_day_starts_at))
         df['real_days'] = pd.DatetimeIndex(df['real_days'].dt.floor('D', ambiguous='infer', nonexistent='shift_forward')).to_julian_date()
         df.drop_duplicates(['cid', 'real_days'], keep='first', inplace=True)
@@ -382,7 +408,7 @@ class Optimizer:
         df['t_history']=[','.join(map(str, item[:-1])) for sublist in t_history for item in sublist]
         r_history = df.groupby('cid', group_keys=False)['r'].apply(lambda x: cum_concat([[i] for i in x]))
         df['r_history']=[','.join(map(str, item[:-1])) for sublist in r_history for item in sublist]
-        df = df[df['id'] >= time.mktime(datetime.strptime(revlog_start_date, "%Y-%m-%d").timetuple()) * 1000]
+        df = df.groupby('cid').filter(lambda group: group['id'].min() > time.mktime(datetime.strptime(revlog_start_date, "%Y-%m-%d").timetuple()) * 1000)
         df['y'] = df['r'].map(lambda x: {1: 0, 2: 1, 3: 1, 4: 1}[x])
         df.to_csv('revlog_history.tsv', sep="\t", index=False)
         print("Trainset saved.")
@@ -420,7 +446,7 @@ class Optimizer:
         df.sort_values(by=['r_history'], inplace=True, ignore_index=True)
 
         if df.shape[0] > 0:
-            for idx in tqdm(df.index):
+            for idx in tqdm(df.index, desc="analysis"):
                 item = df.loc[idx]
                 index = df[(df['i'] == item['i'] + 1) & (df['r_history'].str.startswith(item['r_history']))].index
                 df.loc[index, 'last_stability'] = item['stability']
@@ -455,13 +481,20 @@ class Optimizer:
         https://github.com/open-spaced-repetition/fsrs4anki/wiki/Free-Spaced-Repetition-Scheduler
         '''
 
-    def train(self, lr: float = 4e-2, n_epoch: int = 3, n_splits: int = 3, batch_size: int = 512):
+    def train(self, lr: float = 4e-2, n_epoch: int = 3, n_splits: int = 3, batch_size: int = 512, verbose: bool = True):
         """Step 4"""
         self.dataset = pd.read_csv("./revlog_history.tsv", sep='\t', index_col=None, dtype={'r_history': str ,'t_history': str} )
         self.dataset = self.dataset[(self.dataset['i'] > 1) & (self.dataset['delta_t'] > 0) & (self.dataset['t_history'].str.count(',0') == 0)]
+        if self.dataset.empty:
+            raise ValueError('Training data is inadequate.')
         self.dataset['tensor'] = self.dataset.progress_apply(lambda x: lineToTensor(list(zip([x['t_history']], [x['r_history']]))[0]), axis=1)
         self.dataset['group'] = self.dataset['r_history'] + self.dataset['t_history']
         print("Tensorized!")
+        
+        n_pre_train_groups = len(self.dataset[self.dataset['i'] == 2]['group'].unique())
+        if n_pre_train_groups < n_splits:
+            print("Not enough groups for pre-training. Splitting into {} folds.".format(n_pre_train_groups))
+            n_splits = n_pre_train_groups
 
         w = []
         plots = []
@@ -472,11 +505,11 @@ class Optimizer:
                 train_set = self.dataset.iloc[train_index].copy()
                 test_set = self.dataset.iloc[test_index].copy()
                 trainer = Trainer(train_set, test_set, self.init_w, n_epoch=n_epoch, lr=lr, batch_size=batch_size)
-                w.append(trainer.train())
+                w.append(trainer.train(verbose=verbose))
                 plots.append(trainer.plot())
         else:
             trainer = Trainer(self.dataset, self.dataset, self.init_w, n_epoch=n_epoch, lr=lr, batch_size=batch_size)
-            w.append(trainer.train())
+            w.append(trainer.train(verbose=verbose))
             plots.append(trainer.plot())
 
         w = np.array(w)
@@ -559,13 +592,13 @@ class Optimizer:
         """should not be called before predict_memory_states"""
 
         base = 1.01
-        index_len = 664
-        index_offset = 200
+        minimum_stability = 0.1
+        index_offset = -(np.log(minimum_stability) / np.log(base)).round().astype(int)
         d_range = 10
         d_offset = 1
         r_time = 8
         f_time = 25
-        max_time = 200000
+        max_time = 1e10
 
         type_block = dict()
         type_count = dict()
@@ -590,7 +623,7 @@ class Optimizer:
         print(f"average time for recalled cards: {r_time}s")
 
         def stability2index(stability):
-            return int(round(np.log(stability) / np.log(base)) + index_offset)
+            return (np.log(stability) / np.log(base)).round().astype(int) + index_offset
 
         def init_stability(d):
             return max(((d - self.w[2]) / self.w[3] + 2) * self.w[1] + self.w[0], np.power(base, -index_offset))
@@ -599,14 +632,17 @@ class Optimizer:
             if response == 1:
                 return s * (1 + np.exp(self.w[6]) * (11 - d) * np.power(s, self.w[7]) * (np.exp((1 - r) * self.w[8]) - 1))
             else:
-                return self.w[9] * np.power(d, self.w[10]) * np.power(s, self.w[11]) * np.exp((1 - r) * self.w[12])
+                return np.minimum(self.w[9] * np.power(d, self.w[10]) * np.power(s, self.w[11]) * np.exp((1 - r) * self.w[12]), s)
 
-
+        terminal_stability = minimum_stability
+        for _ in range(128):
+            terminal_stability = cal_next_recall_stability(terminal_stability, 0.96, d_range, 1)
+        index_len = stability2index(terminal_stability)
         stability_list = np.array([np.power(base, i - index_offset) for i in range(index_len)])
         print(f"terminal stability: {stability_list.max(): .2f}")
         df = pd.DataFrame(columns=["retention", "difficulty", "time"])
 
-        for percentage in tqdm(range(96, 66, -2)):
+        for percentage in tqdm(range(96, 66, -2), desc="find optimal retention"):
             recall = percentage / 100
             time_list = np.zeros((d_range, index_len))
             time_list[:,:-1] = max_time
@@ -614,23 +650,26 @@ class Optimizer:
                 s0 = init_stability(d)
                 s0_index = stability2index(s0)
                 diff = max_time
-                while diff > 0.1:
+                iteration = 0
+                while diff > 1 and iteration < 2e5:
+                    iteration += 1
+                    total_time = time_list[d - 1].sum()
+                    s_indices = np.arange(index_len - 2, -1, -1)
+                    stabilities = stability_list[s_indices]
+                    intervals = np.maximum(1, np.round(stabilities * np.log(recall) / np.log(0.9)))
+                    p_recalls = np.power(0.9, intervals / stabilities)
+                    recall_s = cal_next_recall_stability(stabilities, p_recalls, d, 1)
+                    forget_d = np.minimum(d + d_offset, 10)
+                    forget_s = cal_next_recall_stability(stabilities, p_recalls, forget_d, 0)
+                    recall_s_indices = np.minimum(stability2index(recall_s), index_len - 1)
+                    forget_s_indices = np.clip(stability2index(forget_s), 0, index_len - 1)
+                    recall_times = time_list[d - 1][recall_s_indices] + r_time
+                    forget_times = time_list[forget_d - 1][forget_s_indices] + f_time
+                    exp_times = p_recalls * recall_times + (1.0 - p_recalls) * forget_times
+                    mask = exp_times < time_list[d - 1][s_indices]
+                    time_list[d - 1][s_indices[mask]] = exp_times[mask]
+                    diff = total_time - time_list[d - 1].sum()
                     s0_time = time_list[d - 1][s0_index]
-                    for s_index in range(index_len - 2, -1, -1):
-                        stability = stability_list[s_index];
-                        interval = max(1, round(stability * np.log(recall) / np.log(0.9)))
-                        p_recall = np.power(0.9, interval / stability)
-                        recall_s = cal_next_recall_stability(stability, p_recall, d, 1)
-                        forget_d = min(d + d_offset, 10)
-                        forget_s = cal_next_recall_stability(stability, p_recall, forget_d, 0)
-                        recall_s_index = min(stability2index(recall_s), index_len - 1)
-                        forget_s_index = min(max(stability2index(forget_s), 0), index_len - 1)
-                        recall_time = time_list[d - 1][recall_s_index] + r_time
-                        forget_time = time_list[forget_d - 1][forget_s_index] + f_time
-                        exp_time = p_recall * recall_time + (1.0 - p_recall) * forget_time
-                        if exp_time < time_list[d - 1][s_index]:
-                            time_list[d - 1][s_index] = exp_time
-                    diff = s0_time - time_list[d - 1][s0_index]
                 df.loc[0 if pd.isnull(df.index.max()) else df.index.max() + 1] = [recall, d, s0_time]
 
         df.sort_values(by=["difficulty", "retention"], inplace=True)
